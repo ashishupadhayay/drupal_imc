@@ -1,0 +1,66 @@
+<?php
+/**
+ * @file
+ * The install and uninstall script for IMC.
+ */
+
+/**
+ * Implements hook_install().
+ *
+ * Set up field mapping fields
+ */
+function imc_install() {
+
+  $query = "INSERT INTO `imc_fields` (`id`, `key`, `label`)
+VALUES
+	(1,'fname','First Name'),
+	(2,'lname','Last Name'),
+	(3,'country','Country'),
+	(4,'region','Region'),
+	(5,'postcode','Postcode')";
+  db_query($query);
+
+}
+
+/**
+ * Implements hook_schema().
+ */
+function imc_schema() {
+  $schema ['imc_fields'] = array(
+    'fields' => array(
+      'id' => array(
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'key' => array(
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'label' => array(
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+    ),
+    'primary key' => array(
+      'id',
+    ),
+  );
+  return $schema;
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function imc_uninstall() {
+  // Remove IMC variables from DB.
+  variable_del('imc_username');
+  variable_del('imc_password');
+  variable_del('imc_tenant');
+  variable_del('imc_environment');
+  variable_del('imc_field_mappings');
+}

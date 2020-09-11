@@ -1,0 +1,373 @@
+<?php
+
+/**
+ * @file
+ * IMC integration.
+ */
+define('IMC_API_DEVELOPMENT_URL', '');
+define('IMC_API_STAGING_URL', '');
+define('IMC_API_PRODUCTION_URL', '');
+define('IMC_ID_PREFIX', 'PREFIX');
+
+/**
+ * Implements hook_permission().
+ */
+function imc_permission() {
+  return array(
+    'administer imc' => array(
+      'title' => t('Administer IMC'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function imc_menu() {
+  $items = array();
+  $items['admin/config/services/imc'] = array(
+    'title' => 'IMC',
+    'description' => 'Configure IMC.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('imc_config_form'),
+    'access arguments' => array('administer imc'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'imc.admin.inc',
+  );
+  $items['admin/config/services/imc/settings'] = array(
+    'title' => 'Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('imc_config_form'),
+    'access arguments' => array('administer imc'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'file' => 'imc.admin.inc',
+    'weight' => 10,
+  );
+  $items['admin/config/services/imc/fields'] = array(
+    'title' => 'Fields',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('imc_field_mapping_form'),
+    'access arguments' => array('administer imc'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'imc.admin.inc',
+    'weight' => 20,
+  );
+  $items['imc/online-courses'] = array(
+    'title' => 'LMS',
+    'page callback' => 'imc_lms_start',
+    'access callback' => TRUE,
+  );
+  return $items;
+}
+
+/**
+ * LMS start callback.
+ */
+function imc_lms_start() {
+  global $user;
+  // Logged in?
+  if(user_is_logged_in()) {
+    // Get landing url
+    $landing_url = _imc_get_landingurl($user);
+    if(!is_null($landing_url)) {
+      drupal_goto($landing_url);
+    }
+  }
+  else {
+    drupal_goto('user/login', array('query' => array('destination' => '/imc/online-courses')));
+    exit;
+  }
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function imc_user_login(&$edit, $account) {
+  // Get landing url
+  $landing_url = _imc_get_landingurl($account);
+  if(!is_null($landing_url)) {
+    $edit['redirect'] = $landing_url;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function imc_theme() {
+  return array(
+    'imc_search' => array(
+      'template' => 'imc_search',
+      'path' => drupal_get_path('module', 'imc') . '/theme',
+      'arguments' => array('data' => NULL),
+    ),
+    'imc_create' => array(
+      'template' => 'imc_create',
+      'path' => drupal_get_path('module', 'imc') . '/theme',
+      'arguments' => array('data' => NULL),
+    ),
+    'imc_update' => array(
+      'template' => 'imc_update',
+      'path' => drupal_get_path('module', 'imc') . '/theme',
+      'arguments' => array('data' => NULL),
+    ),
+    'imc_landingurl' => array(
+      'template' => 'imc_landingurl',
+      'path' => drupal_get_path('module', 'imc') . '/theme',
+      'arguments' => array('data' => NULL),
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_user_profile_form_alter().
+ */
+function imc_form_user_profile_form_alter(&$form, &$form_state, $form_id) {
+  $form['#validate'][] = 'imc_email_validate';
+}
+
+/**
+ * IMC email validation.
+ */
+function imc_email_validate($form, &$form_state) {
+  $user = $form['#user'];
+  $params = array();
+
+  $imc_user = FALSE;
+  if(array_key_exists('imc_id', $user->data)) {
+    $imc_user = TRUE;
+  }
+
+  // Check if user exists in IMC and new email?
+  if($imc_user && $user->mail != $form_state['values']['mail']) {
+    $params['email'] = $form_state['values']['mail'];
+    $request = _imc_request('search', $params);
+    $search = _imc_process('scim/Users/.search', $request);
+    if($search) {
+      // Was request successful? Search returned 200
+      if($search->code == 200) {
+        // Did it return an object?
+        if(get_object_vars($search->data)) {
+          form_set_error('mail', t('Email address @email already exists in LMS (!user_id).', array('@email' => $params['email'], '!user_id' => $search->data->Resources->id)));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_email_confirm().
+ */
+function imc_email_confirm($op, $uid, $old_mail, $new_mail) {
+  if($op == 'email confirmation') {
+    $account = user_load($uid);
+    // Update email on LMS
+    if(array_key_exists('imc_id', $account->data)) {
+      $id = $account->data['imc_id'];
+      $params = _imc_request_params($account);
+      $request = _imc_request('update', $params);
+      $update = _imc_process('scim/Users/' . $id, $request, 'PUT');
+      if($update) {
+        if($update->code != 200) {
+          watchdog('imc', '!code: Error updating user (!user_id)', array('!code' => $update->code, '!user_id' => $id), WATCHDOG_ERROR);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Get landing url.
+ */
+function _imc_get_landingurl($account) {
+  $get_landingurl = FALSE;
+  $get_detail = FALSE;
+  $params = _imc_request_params($account);
+
+  // Check if ID exists
+  if(array_key_exists('imc_id', $account->data)) {
+    $id = $account->data['imc_id'];
+    // Request body is not required
+    $detail = _imc_process('scim/Users/' . $id, NULL, 'GET');
+    if($detail) {
+      // Was request successful? Detail returned 200 (returns 404 if not found)
+      if($detail->code == 200) {
+        $get_detail = TRUE;
+        $get_landingurl = TRUE;
+
+        // Update
+        $request = _imc_request('update', $params);
+        $update = _imc_process('scim/Users/' . $id, $request, 'PUT');
+        if($update) {
+          if($update->code != 200) {
+            watchdog('imc', '!code: Error updating user (!user_id)', array('!code' => $update->code, '!user_id' => $id), WATCHDOG_ERROR);
+          }
+        }
+      }
+    }
+  }
+
+  if(!$get_detail) {
+    $request = _imc_request('search', $params);
+    $search = _imc_process('scim/Users/.search', $request);
+    if($search) {
+      // Was request successful? Search returned 200
+      if($search->code == 200) {
+        // Did it return an object?
+        if(get_object_vars($search->data)) {
+          $get_landingurl = TRUE;
+          $id = $search->data->Resources->id;
+          // Update
+          $request = _imc_request('update', $params);
+          $update = _imc_process('scim/Users/' . $id, $request, 'PUT');
+          if($update) {
+            if($update->code != 200) {
+              watchdog('imc', '!code: Error updating user (!user_id)', array('!code' => $update->code, '!user_id' => $id), WATCHDOG_ERROR);
+            }
+            else {
+              // Save imc_id to db
+              user_save($account, array('data' => array('imc_id' => $id)));
+            }
+          }
+        }
+        else {
+          // Create
+          $params['id'] = $id = IMC_ID_PREFIX . '-' . $account->uid . '-' . date('YmdHis');
+          $request = _imc_request('create', $params);
+          $create = _imc_process('scim/Users', $request);
+          if($create) {
+            if($create->code != 201) {
+              watchdog('imc', '!code: Error creating user (!user_id)', array('!code' => $create->code, '!user_id' => $id), WATCHDOG_ERROR);
+              drupal_set_message(t('Oops! Something went wrong. <a href="!url">Click here</a> to try again.', array('!url' => '/imc/online-courses')), 'error');
+            }
+            else {
+              $get_landingurl = TRUE;
+              // Save imc_id to db
+              user_save($account, array('data' => array('imc_id' => $id)));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Get landing url?
+  if($get_landingurl) {
+    $request = _imc_request('landingurl', $params);
+    $landingurl = _imc_process('client/landingURL', $request);
+    if($landingurl) {
+      if($landingurl->code != 200) {
+        watchdog('imc', '!code: Error getting landing url (!user_id)', array('!code' => $landingurl->code, '!user_id' => $id), WATCHDOG_ERROR);
+      }
+      else {
+        return $landingurl->data->landingUrl;
+      }
+    }
+  }
+  return NULL;
+}
+
+/**
+ * Request data
+ */
+function _imc_request_params($account) {
+  $params = array();
+
+  // Mappings
+  $imc_field_mappings = variable_get('imc_field_mappings', array());
+  foreach($imc_field_mappings as $k=>$v) {
+    $wrapper = entity_metadata_wrapper('user', $account);
+    $params[$k] = $wrapper->$v->value();
+  }
+
+  // Additional fields
+  $params['email'] = $account->mail;
+
+  // Countries module installed?
+  if(module_exists('countries')) {
+    $wrapper = entity_metadata_wrapper('country', $params['country']);
+    // We need ISO2
+    $params['country'] = $wrapper->iso2->value();
+  }
+
+  // Get data from CSV
+  $csv = drupal_get_path('module', 'imc') . '/data/countries.csv';
+  $countries = array();
+  if (($fp = fopen($csv, 'r')) !== FALSE) {
+    while (($data = fgetcsv($fp, 1000, ',')) !== FALSE) {
+      if(count($data) == 2) {
+        $countries[$data[0]] = $data[1];
+      }
+    }
+    fclose($fp);
+  }
+
+  $cid = 0;
+  if(array_key_exists($params['country'], $countries)) {
+    $cid = $countries[$params['country']];
+  }
+  $params['country'] = $cid;
+
+  return $params;
+}
+
+/**
+ * Prepare request.
+ */
+function _imc_request($key, $data) {
+  //drupal_add_http_header('Content-Type', 'application/json');
+  return theme('imc_' . $key, array('data' => $data));
+}
+
+/**
+ * Process request.
+ */
+function _imc_process($endpoint, $request, $method = 'POST') {
+  // API endpoint
+  $environment = variable_get('imc_environment', 'DEV');
+  switch($environment) {
+    case 'DEV':
+      $url = IMC_API_DEVELOPMENT_URL . $endpoint;
+      break;
+    case 'STAGE':
+      $url = IMC_API_STAGING_URL . $endpoint;
+      break;
+    case 'PROD':
+      $url = IMC_API_PRODUCTION_URL . $endpoint;
+      break;
+  }
+
+  // CURL request
+  $c = curl_init();
+  curl_setopt($c, CURLOPT_URL, $url);
+  curl_setopt($c, CURLOPT_USERPWD, variable_get('imc_username', '') . ':' . variable_get('imc_password', ''));
+  curl_setopt($c, CURLOPT_HTTPHEADER, array('Content-Type: application/json', 'Accept: application/json'));
+  curl_setopt($c, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($c, CURLOPT_SSL_VERIFYPEER, 0);
+  curl_setopt($c, CURLOPT_FOLLOWLOCATION, 0);
+  if(!is_null($request)) {
+    curl_setopt($c, CURLOPT_POSTFIELDS, $request);
+  }
+
+  switch($method) {
+    case 'POST':
+      curl_setopt($c, CURLOPT_POST, 1);
+      break;
+    case 'PUT':
+      curl_setopt($c, CURLOPT_CUSTOMREQUEST, 'PUT');
+      break;
+  }
+  $response = curl_exec($c);
+
+  // Check if error?
+  if (curl_errno($c)) {
+    watchdog('imc', 'Error making cURL request (!curl_errorno : !curl_error)', array('!curl_errorno' => curl_errno($c), '!curl_error' => curl_error($c)), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  else {
+    $obj = new stdClass();
+    $obj->code = curl_getinfo($c, CURLINFO_HTTP_CODE);
+    $obj->data = json_decode($response);
+    return $obj;
+  }
+  curl_close($c);
+}
